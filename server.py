@@ -5,6 +5,7 @@ import uvicorn
 import uuid
 import datetime
 import mysql.connector
+import certifi
 from decimal import Decimal, ROUND_HALF_UP
 
 # ===== 1) DB 설정 =====
@@ -311,3 +312,4 @@ def usage_monthly(agent_id: str = Query(...)):
 # ===== 14) 서버 실행 =====
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+

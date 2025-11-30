@@ -17,7 +17,7 @@ DB_CONFIG = {
     "database": "test",
     "ssl_ca": certifi.where(),
     "ssl_disabled": False,
-    "ssl_verify_identity": True,   # ← 추가
+    "ssl_verify_identity": True,
     "use_pure": True,
 }
 
@@ -37,7 +37,7 @@ class PowerIn(BaseModel):
     device_logical_id: int
     power_w: float
     timestamp: str
-    sample_sec: int | None = None  # 에이전트가 보내면 사용(없으면 60초로 처리)
+    sample_sec: int | None = None  # 없으면 60초로 취급
 
 class CommandIn(BaseModel):
     agent_id: str
@@ -86,8 +86,6 @@ def calc_bill_from_kwh(monthly_kwh: float) -> int:
 
 # ===== 5) DB 커넥션 =====
 def get_conn():
-    # TiDB TLS가 필요한 경우, mysql-connector-python은 기본 TLS를 사용하므로
-    # 추가 설정 없이도 동작합니다. (필요시 client_flags/ssl_args 추가)
     return mysql.connector.connect(**DB_CONFIG)
 
 # ===== 6) /power : 데이터 수집 =====
@@ -110,7 +108,7 @@ def ingest_power(data: PowerIn):
         (data.device_logical_id, data.agent_id, data.device_alias, data.power_w, ts),
     )
 
-    # power_logs insert (sample_sec 없으면 60초로 기록)
+    # power_logs insert
     sample_sec = data.sample_sec if data.sample_sec and data.sample_sec > 0 else 60
     try:
         cur.execute(
@@ -121,7 +119,6 @@ def ingest_power(data: PowerIn):
             (data.agent_id, data.device_logical_id, data.power_w, ts, sample_sec),
         )
     except mysql.connector.Error as e:
-        # sample_sec 컬럼이 없는 경우의 백업 쿼리
         if "Unknown column 'sample_sec'" in str(e):
             cur.execute(
                 """
@@ -170,7 +167,7 @@ def create_command(cmd: CommandIn):
     cur.close(); conn.close()
     return {"ok": True, "id": cmd_id}
 
-# ===== 프론트 호환 제어(옵션) =====
+# ===== 9) 프론트 호환 제어 (PUT) =====
 @app.put("/api/devices/{device_id}/power")
 def control_device_power(device_id: int, control: DeviceControlIn):
     conn = get_conn()
@@ -194,7 +191,7 @@ def control_device_power(device_id: int, control: DeviceControlIn):
     cur.close(); conn.close()
     return {"success": True, "message": f"Device {device['alias']} turned {control.status}"}
 
-# ===== 9) 에이전트 명령 조회/ACK =====
+# ===== 10) 에이전트 명령 조회/ACK =====
 @app.get("/commands")
 def get_commands(agent_id: str = Query(...)):
     conn = get_conn()
@@ -229,7 +226,7 @@ def ack_command(cmd_id: str):
     cur.close(); conn.close()
     return {"ok": True}
 
-# ===== 10) 알림(선택 구현) =====
+# ===== 11) 알림(선택) =====
 @app.get("/api/notifications")
 def get_notifications(agent_id: str = Query(None)):
     conn = get_conn()
@@ -262,12 +259,11 @@ def read_notification(noti_id: int):
     finally:
         cur.close(); conn.close()
 
-# ===== 11) 사용량 요약 (today/daily/monthly) =====
+# ===== 12) 사용량 요약 =====
 @app.get("/usage/today")
 def usage_today(agent_id: str = Query(...)):
     conn = get_conn()
     cur = conn.cursor(dictionary=True)
-    # sample_sec 있으면 그 값, 없으면 60초 사용
     cur.execute("""
         SELECT
           d.alias,
@@ -353,7 +349,7 @@ def usage_monthly(agent_id: str = Query(...)):
         "devices": rows,
     }
 
-# ===== 12) 대기전력 분석 (/api/analysis/waste) =====
+# ===== 12-1) 월 총 kWh 유틸 =====
 def month_kwh_total(agent_id: str) -> float:
     month_start = dt.datetime.today().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     start_str = month_start.strftime("%Y-%m-%d %H:%M:%S")
@@ -370,6 +366,7 @@ def month_kwh_total(agent_id: str) -> float:
     cur.close(); conn.close()
     return float(row["kwh"] or 0.0)
 
+# ===== 13) 대기전력 분석 =====
 @app.get("/api/analysis/waste")
 def analysis_waste(
     agent_id: str = Query(...),
@@ -377,16 +374,11 @@ def analysis_waste(
     fresh_sec: int = Query(180, description="최근 N초 이내 보고만 현재 켜짐으로 간주"),
     assume_hours_per_day: float = Query(24.0, description="대기 상태 하루 시간(기본 24h)")
 ):
-    """
-    켜져 있으나 소비가 작아(대기전력) 보이는 기기 목록과 '끄면 월 절약액' 추정
-    """
     now = dt.datetime.utcnow()
     fresh_after = (now - dt.timedelta(seconds=fresh_sec)).strftime("%Y-%m-%d %H:%M:%S")
 
     conn = get_conn()
     cur = conn.cursor(dictionary=True)
-
-    # device_settings가 있으면 사용, 없으면 NULL => 기본값으로 처리
     cur.execute("""
         SELECT
           d.id AS device_id,
@@ -422,7 +414,6 @@ def analysis_waste(
 
         hours_per_day = float(r.get("standby_hours_per_day") or assume_hours_per_day)
         delta_kwh = (standby_w/1000.0) * hours_per_day * 30.0
-
         new_bill = calc_bill_from_kwh(max(base_kwh - delta_kwh, 0.0))
         saving = base_bill - new_bill
 
@@ -452,6 +443,127 @@ def analysis_waste(
         "items": items
     }
 
-# ===== 13) 서버 실행 =====
+# ===== 14) [추가] 구간 합산 유틸 (kWh & 시간) =====
+def sum_kwh_and_hours(agent_id: str, start: str, end: str, device_id: int | None = None):
+    """
+    구간 [start, end) 동안:
+      - kWh = Σ (W/1000 * sample_sec/3600)
+      - hours = Σ (sample_sec)/3600
+    """
+    conn = get_conn()
+    cur = conn.cursor(dictionary=True)
+    sql = """
+        SELECT
+          SUM((pl.power_w/1000.0) * (COALESCE(pl.sample_sec,60)/3600.0)) AS kwh,
+          SUM(COALESCE(pl.sample_sec,60))/3600.0 AS hours
+        FROM power_logs pl
+        WHERE pl.agent_id = %s
+          AND pl.ts >= %s AND pl.ts < %s
+    """
+    params = [agent_id, start, end]
+    if device_id is not None:
+        sql += " AND pl.device_id = %s"
+        params.append(device_id)
+    cur.execute(sql, tuple(params))
+    row = cur.fetchone()
+    cur.close(); conn.close()
+    return float(row["kwh"] or 0.0), float(row["hours"] or 0.0)
+
+# ===== 15) [추가] 어제 대비 인사이트 =====
+@app.get("/api/analysis/yesterday_delta")
+def analysis_yesterday_delta(
+    agent_id: str = Query(...),
+    device_id: int | None = Query(None, description="없으면 전체"),
+    timezone: str = Query("Asia/Seoul")
+):
+    now = dt.datetime.now()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    yday_start = today_start - dt.timedelta(days=1)
+    yday_end = today_start
+
+    ts_today_start = today_start.strftime("%Y-%m-%d %H:%M:%S")
+    ts_now = now.strftime("%Y-%m-%d %H:%M:%S")
+    ts_yday_start = yday_start.strftime("%Y-%m-%d %H:%M:%S")
+    ts_yday_end = yday_end.strftime("%Y-%m-%d %H:%M:%S")
+
+    kwh_today, hours_today = sum_kwh_and_hours(agent_id, ts_today_start, ts_now, device_id)
+    kwh_yday, hours_yday   = sum_kwh_and_hours(agent_id, ts_yday_start, ts_yday_end, device_id)
+
+    delta_hours = hours_today - hours_yday
+    delta_kwh   = kwh_today - kwh_yday
+
+    # 간단 단가(평균)로 바로 원화 추정
+    KRW_PER_KWH = 200.0
+    delta_krw   = int(round(delta_kwh * KRW_PER_KWH, 0))
+
+    if delta_hours > 0.1 and delta_krw > 0:
+        msg = f"어제보다 사용 시간이 {delta_hours:.1f}시간 늘어, 약 {delta_krw:,}원의 요금 추가가 예상돼요."
+        tone = "up"
+    elif delta_hours < -0.1 and delta_krw < 0:
+        msg = f"어제보다 사용 시간이 {abs(delta_hours):.1f}시간 줄어, 약 {abs(delta_krw):,}원 절약이 예상돼요."
+        tone = "down"
+    else:
+        msg = "어제와 비슷한 사용 패턴이에요."
+        tone = "flat"
+
+    return {
+        "agent_id": agent_id,
+        "device_id": device_id,
+        "timezone": timezone,
+        "today_range": [ts_today_start, ts_now],
+        "yesterday_range": [ts_yday_start, ts_yday_end],
+        "hours_today": round(hours_today, 2),
+        "hours_yesterday": round(hours_yday, 2),
+        "delta_hours": round(delta_hours, 2),
+        "kwh_today": round(kwh_today, 3),
+        "kwh_yesterday": round(kwh_yday, 3),
+        "delta_kwh": round(delta_kwh, 3),
+        "estimated_delta_krw": delta_krw,
+        "insight_message": msg,
+        "tone": tone  # up | down | flat
+    }
+
+# ===== 16) [추가] 이번 달 vs 지난 달 (라이트) =====
+@app.get("/usage/monthly_compare")
+def usage_monthly_compare(agent_id: str = Query(...)):
+    today = dt.date.today()
+    this_start = today.replace(day=1)
+    last_end = this_start
+    last_start = (this_start - dt.timedelta(days=1)).replace(day=1)
+
+    fmt = "%Y-%m-%d %H:%M:%S"
+    ts_this_start = dt.datetime(this_start.year, this_start.month, 1).strftime(fmt)
+    ts_now = dt.datetime.now().strftime(fmt)
+    ts_last_start = dt.datetime(last_start.year, last_start.month, 1).strftime(fmt)
+    ts_last_end = dt.datetime(last_end.year, last_end.month, 1).strftime(fmt)
+
+    this_kwh, _ = sum_kwh_and_hours(agent_id, ts_this_start, ts_now, None)
+    last_kwh, _ = sum_kwh_and_hours(agent_id, ts_last_start, ts_last_end, None)
+
+    if last_kwh <= 0:
+        diff_percent = 100.0 if this_kwh > 0 else 0.0
+    else:
+        diff_percent = (this_kwh - last_kwh) / last_kwh * 100.0
+
+    if diff_percent >= 15:
+        status = "warning"
+        analysis_message = f"지난달보다 {diff_percent:.0f}% 더 쓰고 있어요 😅"
+    elif diff_percent <= -10:
+        status = "good"
+        analysis_message = f"지난달보다 {abs(diff_percent):.0f}% 절약 중이에요 👍"
+    else:
+        status = "normal"
+        analysis_message = "지난달과 비슷해요 🙂"
+
+    return {
+        "agent_id": agent_id,
+        "this_month_kwh": round(this_kwh, 2),
+        "last_month_kwh": round(last_kwh, 2),
+        "diff_percent": round(diff_percent, 1),
+        "status": status,
+        "analysis_message": analysis_message
+    }
+
+# ===== 17) 서버 실행 =====
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
